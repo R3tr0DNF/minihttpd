@@ -1,60 +1,73 @@
-#include <sys/socket.h>
+#include <stdio.h>
 #include <sys/types.h>
+#include <sys/socket.h>
 #include <netinet/in.h>
 
-#include <unistd.h>
-#include <stdio.h>
+#include <ctype.h>
+#include <stdlib.h>
 #include <string.h>
+#include <netdb.h>
 #include <errno.h>
+#include <unistd.h>
 
-#define BUFSIZE 4096
+int main(){
 
-int passiveTCP(const char *service, int qlen);
-int errexit(const char *format, ...);
-int HTTPserver(int fd);
+    struct addrinfo hints;
+    struct addrinfo *result;
+    struct addrinfo *rp;
 
-/*HTTPSV*/
+    struct sockaddr_in fsin;
 
-int
-main (int argc, char *argv[]){
-    int sd;
-    char *service = "http";
-    struct sockaddr_in cltaddr;
+    int rc;
+    int sd = -1; /*server sock*/
+    int last_error = 0;
+    int nsd = -1; /*client sock*/
     unsigned int alen;
-    int nsd;
 
-    switch(argc){
-        case 1:
-            break;
-        case 2:
-            service = argv[1];
-            break;
-        default:
-            errexit("usage: %s [port]\n", argv[0]);
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    hints.ai_flags = AI_PASSIVE;
+
+    rc = getaddrinfo(NULL, "5000", &hints, &result);
+
+    if (rc != 0){
+        printf("can't resolve");
+        return -1;
     }
 
-    sd = passiveTCP(service, 5);
-    
-    while(1){
+    /*create a socket*/
 
-        nsd = accept(sd, (struct sockaddr *)&cltaddr, &alen);
-        HTTPserver(nsd);
-        /* fd = open(frame, O_RDONLY); */
+    for(rp = result; rp != NULL; rp = rp->ai_next){
 
+        sd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
 
+        if (sd == -1){
+            last_error = errno;
+            continue;
+        }
+
+        if(bind(sd, rp ->ai_addr, rp->ai_addrlen) == -1){
+            last_error = errno;
+            close(sd);
+            sd = -1;
+            continue;
+        } else {
+            if (listen(sd, 5)== -1){
+                last_error = errno;
+                close(sd);
+                sd = -1;
+                continue;
+            } else {
+               break;
+            }
+        }        
     }
-}
 
-int
-HTTPserver(int fd){
-    char buf[BUFSIZE];
-    int cc;
+    freeaddrinfo(result);
 
-    while (cc = read(fd, buf, sizeof buf)){
-        if (cc < 0)
-            errexit("server read: %s\n", strerror(errno));
-        if (write(fd, buf, cc)< 0)
-            errexit("server write: %s\n", strerror(errno));
-    }
-    return 0;
+    /*socket on accept*/
+    nsd = accept(sd, (struct sockaddr*)&fsin, &alen);
+
 }
