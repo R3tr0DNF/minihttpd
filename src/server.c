@@ -10,19 +10,15 @@
 #include <errno.h>
 #include <unistd.h>
 
-int main(){
+int server_init(void){
 
     struct addrinfo hints;
     struct addrinfo *result;
     struct addrinfo *rp;
 
-    struct sockaddr_in fsin;
-
     int rc;
     int sd = -1; /*server sock*/
     int last_error = 0;
-    int nsd = -1; /*client sock*/
-    unsigned int alen;
 
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
@@ -67,7 +63,6 @@ int main(){
 
     freeaddrinfo(result);
 
-    /*socket on accept*/
-    nsd = accept(sd, (struct sockaddr*)&fsin, &alen);
+    return sd;
 
 }
