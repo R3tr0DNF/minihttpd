@@ -32,14 +32,18 @@ int main(){
         return 1;
     }
 
-    rv = recv(nsd, buffer, sizeof(buffer), 0);
+    rv = recv(nsd, buffer, sizeof(buffer) - 1, 0);
 
     if (rv == -1){
         perror("recv");
         close(nsd);
-        return 1;
+        close(sd);
+        return 0;
     } else if (rv == 0){
         printf("Cliente cerro conexion");
+    } else {
+        buffer[rv] = '\0';
+        printf("Cliente dice: %s\n", buffer);
     }
 
     
