@@ -69,7 +69,45 @@ int main(){
 
     while (1)
     {
-  
+        
+        n_events = epoll_wait(epfd, events, MAX_EVENTS, -1);
+
+        if (n_events == -1){
+            if (errno == EINTR){
+                continue;
+            }
+            
+            perror("epoll_wait");
+            break;
+        }
+
+        for(int i = 0; i < n_events; i++){
+            int fd = events[i].data.fd;
+
+            if (fd == sd){
+                while (1){
+                    
+                    nsd = accept(sd, (struct sockaddr *)&fsin, &alen);
+
+                    if (nsd == -1){
+                        if(errno == EAGAIN || errno == EWOULDBLOCK){
+                            break;
+                        }
+
+                        if (errno == EINTR){
+                            continue;
+                        }
+
+                        perror("accept");
+                        break;
+                    }
+
+                }
+                
+            } else {
+
+            }
+        }
     
         nsd = accept(sd, (struct sockaddr *)&fsin, &alen);
 
