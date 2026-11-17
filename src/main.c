@@ -8,6 +8,7 @@
 #include <errno.h>
 
 #define SIZEBUF 4096
+#define MAX_EVENTS 64
 
 int main(){
     int sd;
@@ -15,24 +16,60 @@ int main(){
     socklen_t alen = sizeof(fsin);
     int nsd;
     int flags;
+    int epfd;
+    struct epoll_event ev;
+    struct epoll_event events[MAX_EVENTS];
+    int n_events;
     
     char buffer[SIZEBUF];
     ssize_t rv;
 
 
     sd = server_init();
-    flags = fcntl(sd, F_GETFL,0);
-
 
     if (sd == -1){
         perror("server_init");
         return 1;
     }
+    
+    /*Change the configuration of the socket*/
+    flags = fcntl(sd, F_GETFL,0);
+    if (flags == -1){
+        perror("fcntl F_GETFL");
+        close(sd);
+        return 1;
+    }
+
+    if (fcntl(sd, F_SETFL, flags | O_NONBLOCK) == -1){
+        perror("fcntl F_SETFL");
+        close(sd);
+        return 1;
+    }
+
+    /*Creating the epoll*/
+    epfd = epoll_create1(EPOLL_CLOEXEC);
+
+    if (epfd == -1){
+        perror("epoll_create1");
+        close(sd);
+        return 1;
+    }
+    
+    ev.events = EPOLLIN;
+    ev.data.fd = sd;
+
+    if(epoll_ctl(epfd, EPOLL_CTL_ADD, sd, &ev) == -1){
+        perror("epoll_ctl");
+        close(epfd);
+        close(sd);
+        return 1;
+    }
 
     printf("Servidor iniciado correctamente");
-    
+
     while (1)
     {
+  
     
         nsd = accept(sd, (struct sockaddr *)&fsin, &alen);
 
