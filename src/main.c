@@ -12,13 +12,14 @@
 
 int main(){
     int sd;
-    struct sockaddr_in fsin;
-    socklen_t alen = sizeof(fsin);
     int nsd;
-    int flags;
+    int flags_sd;
+    int flags_nsd;
     int epfd;
     struct epoll_event ev;
     struct epoll_event events[MAX_EVENTS];
+    struct epoll_event client_ev;
+
     int n_events;
     
     char buffer[SIZEBUF];
@@ -33,14 +34,14 @@ int main(){
     }
     
     /*Change the configuration of the socket*/
-    flags = fcntl(sd, F_GETFL,0);
-    if (flags == -1){
+    flags_sd = fcntl(sd, F_GETFL,0);
+    if (flags_sd == -1){
         perror("fcntl F_GETFL");
         close(sd);
         return 1;
     }
 
-    if (fcntl(sd, F_SETFL, flags | O_NONBLOCK) == -1){
+    if (fcntl(sd, F_SETFL, flags_sd | O_NONBLOCK) == -1){
         perror("fcntl F_SETFL");
         close(sd);
         return 1;
@@ -86,8 +87,8 @@ int main(){
 
             if (fd == sd){
                 while (1){
-                    
-                    nsd = accept(sd, (struct sockaddr *)&fsin, &alen);
+
+                    nsd = accept(sd, NULL, NULL);
 
                     if (nsd == -1){
                         if(errno == EAGAIN || errno == EWOULDBLOCK){
@@ -102,37 +103,76 @@ int main(){
                         break;
                     }
 
+                    flags_nsd = fcntl(nsd, F_GETFL, 0);
+
+                    if (flags_nsd == -1){
+                        perror("fcntl F_GETFL");
+                        close(nsd);
+                        continue;
+                    }
+
+                    if(fcntl(nsd, F_SETFL, flags_nsd | O_NONBLOCK) == -1){
+                        perror("fcntl F_SETFL");
+                        close(nsd);
+                        continue;
+                    }
+
+                    client_ev.events = EPOLLIN;
+                    client_ev.data.fd = nsd;
+
+                    if(epoll_ctl(epfd, EPOLL_CTL_ADD, nsd, &client_ev) == -1){
+                        perror("epoll_ctl");
+                        close(nsd);
+                        continue;
+                    }
+
                 }
                 
             } else {
 
+                rv = recv(fd, buffer, SIZEBUF, 0);
+                
+                if (rv > 0){
+                    buffer[rv] = '\0';
+                    printf("Received data from fd %d: %s\n", fd, buffer);
+                }
+
+                if (rv == 0){
+                    printf("Client disconnected, fd: %d\n", fd);
+
+                    if (epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL) == -1){
+                        perror("epoll_ctl DEL");                       
+                    }
+            
+                    close(fd);
+                    continue; 
+                }
+                
+                if (rv == -1){
+                   if(errno == EAGAIN || errno == EWOULDBLOCK){
+                    continue;
+                   }
+
+                   if(errno == EINTR){
+                    printf("Call interrupted...");
+                    continue;
+                   }
+
+                    perror("epoll_ctl DEL");
+                    if (epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL) == -1){
+                    perror("epoll_ctl DEL");                       
+                    
+                    close(fd);
+                    continue; 
+                   }
+
+
+                }
+
+
             }
         }
-    
-        nsd = accept(sd, (struct sockaddr *)&fsin, &alen);
-
-        if (nsd == -1){
-            perror("accept");
-            close(sd);
-            return 1;
-        }
-
-        rv = recv(nsd, buffer, sizeof(buffer) - 1, 0);
-
-        if (rv == -1){
-            perror("recv");
-            close(nsd);
-            close(sd);
-            return 0;
-        } else if (rv == 0){
-            printf("Cliente cerro conexion");
-        } else {
-            buffer[rv] = '\0';
-            printf("Cliente dice: %s\n", buffer);
-        }
     }
-    
-
 
     return 0;
 
