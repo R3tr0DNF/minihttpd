@@ -23,4 +23,11 @@ struct http_request {
     char version[HTTP_VERSION_SIZE];
 };
 
+enum http_parse_result parse_http_request(
+    const char *buffer,
+    size_t buffer_len,
+    struct http_request *request,
+    size_t *bytes_consumed
+);
+
 #endif
