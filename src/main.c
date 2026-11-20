@@ -2,12 +2,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <sys/epoll.h>
-#include <sys/sendfile.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
-#include <signal.h>
+#include <stdint.h>
 
 #include "server.h"
 #include "http.h"
@@ -85,7 +84,7 @@ static int process_http_request(int epfd, struct client *client) {
     }
 
     if (result == HTTP_BAD_REQUEST) {
-        return prepare_http_response(epfd, client, 400, "text/plain", 0, -1, 0) == -1 ? -1 : 1;
+        return prepare_http_response(epfd, client, HTTP_STATUS_BAD_REQUEST, "text/plain", 0, -1, 0) == -1 ? -1 : 1;
     }
 
     if (bytes_consumed == 0 || bytes_consumed > client->buffer_len){
@@ -97,7 +96,7 @@ static int process_http_request(int epfd, struct client *client) {
     client->buffer_len = remaining;
 
     if (strcmp(client->request.method, "GET") != 0) {
-        return prepare_http_response(epfd, client, 405, "text/plain", 0, -1, 0) == -1 ? -1 : 1;
+        return prepare_http_response(epfd, client, HTTP_STATUS_METHOD_NOT_ALLOWED, "text/plain", 0, -1, 0) == -1 ? -1 : 1;
     }
 
     int file_fd = -1;
@@ -105,7 +104,7 @@ static int process_http_request(int epfd, struct client *client) {
     int status = open_file(client->request.target, &file_fd, &file_size);
     const char *mime = "text/plain";
 
-    if (status == 200) {
+    if (status == HTTP_STATUS_OK) {
         char mime_path[HTTP_TARGET_SIZE];
         size_t path_len = strcspn(client->request.target, "?#");
 
@@ -252,7 +251,7 @@ int main(void) {
             if ((event_flags & (EPOLLIN | EPOLLRDHUP)) && client->response_len == 0) {
                 while (1) {
                     if (client->buffer_len >= SIZEBUF) {
-                        if (prepare_http_response(epfd, client, 400, "text/plain", 0, -1, 0) == -1) {
+                        if (prepare_http_response(epfd, client, HTTP_BAD_REQUEST, "text/plain", 0, -1, 0) == -1) {
                             close_client(epfd, client);
                             client = NULL;
                         }
@@ -302,7 +301,7 @@ int main(void) {
 
                 if (client->read_closed && client->response_len == 0) {
                     if (client->buffer_len > 0) {
-                        if (prepare_http_response(epfd, client, 400, "text/plain", 0, -1, 0) == -1) {
+                        if (prepare_http_response(epfd, client, HTTP_BAD_REQUEST, "text/plain", 0, -1, 0) == -1) {
                             close_client(epfd, client);
                             continue;
                         }
