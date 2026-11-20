@@ -1,4 +1,4 @@
-# MiniHTTPd
+# MiniHTTPd - Junbo Frank
 
 Un servidor HTTP con concurrencia implementado con EPOLL en C, sin librerias externas, con procesamiento de solicitudes HTTP
 
