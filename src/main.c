@@ -1,137 +1,137 @@
-
 #include <stdio.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include "server.h"
 #include <sys/epoll.h>
+#include <sys/sendfile.h>
 #include <fcntl.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+
+#include "server.h"
 #include "http.h"
+#include "files.h"
+#include "mime.h"
 
-#define SIZEBUF (HTTP_MAX_REQUEST_LINE + HTTP_MAX_HEADERS_SIZE + 4)
 #define MAX_EVENTS 64
-
-struct client {
-    int fd;
-    char buffer[SIZEBUF];
-    size_t buffer_len;
-    struct http_request request;
-    char response[4096];
-    size_t response_len;
-    size_t response_sent;
-    int close_after_response;
-    int read_closed;
-    struct client *next;
-};
 
 struct client *clients = NULL;
 
-void close_client(int epfd, int fd) {
+static void close_client(int epfd, struct client *client) {
     struct client **current = &clients;
 
-    while (*current != NULL && (*current)->fd != fd) {
+    while (*current != NULL && *current != client){
         current = &(*current)->next;
-    }
+    } 
 
-    if (*current == NULL) {
+    if (*current == NULL){
         return;
     }
 
-    struct client *client = *current;
     *current = client->next;
+    epoll_ctl(epfd, EPOLL_CTL_DEL, client->fd, NULL);
+    close(client->fd);
 
-    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
-    close(fd);
+    if (client->file_fd >= 0){
+        close(client->file_fd);
+    }
     free(client);
 }
 
-static int queue_http_response(int epfd, struct client *client, int status_code, const char *content_type, size_t content_length, int keep_alive) {
-    int response_size = build_http_response(status_code, content_type, content_length, keep_alive, client->response, sizeof(client->response));
+static int prepare_http_response(int epfd, struct client *client, int status, const char *mime, size_t file_size, int file_fd, int keep_alive) {
+    
+    int header_length = build_http_response(status, mime, file_size, keep_alive, client->response, sizeof(client->response));
 
-    if (response_size == -1) {
-        return -1;
+    if (header_length == -1) {
+        if (file_fd >= 0) {
+            close(file_fd);
+        }
+            return -1;
     }
 
-    client->response_len = (size_t)response_size;
+    client->response_len = (size_t)header_length;
     client->response_sent = 0;
+    client->file_fd = file_fd;
+    client->file_size = file_fd >= 0 ? file_size : 0;
+    client->file_offset = 0;
+    client->file_buffer_len = 0;
+    client->file_buffer_sent = 0;
     client->close_after_response = !keep_alive;
 
-    struct epoll_event client_ev = {0};
-    client_ev.events = EPOLLOUT | EPOLLRDHUP;
-    client_ev.data.fd = client->fd;
+    struct epoll_event ev = {0};
+    ev.events = EPOLLOUT | EPOLLRDHUP;
+    ev.data.ptr = client;
 
-    return epoll_ctl(epfd, EPOLL_CTL_MOD, client->fd, &client_ev);
-}
-
-static int send_client_response(struct client *client) {
-    while (client->response_sent < client->response_len) {
-        ssize_t sent = send(client->fd, client->response + client->response_sent, client->response_len - client->response_sent, MSG_NOSIGNAL);
-
-        if (sent > 0) {
-            client->response_sent += (size_t)sent;
-            continue;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, client->fd, &ev) == -1) {
+        if (client->file_fd >= 0) {
+            close(client->file_fd);
         }
-
-        if (sent == -1 && errno == EINTR) {
-            continue;
-        }
-
-        if (sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            return 0;
-        }
-
+        client->file_fd = -1;
         return -1;
     }
 
-    return 1;
+    return 0;
 }
 
-static int process_buffered_request(int epfd, struct client *client) {
-    size_t bytes_consumed = 0;
+static int process_http_request(int epfd, struct client *client) {
 
-    if (client->buffer_len == 0) {
-        return 0;
-    }
+    size_t bytes_consumed = 0;
 
     enum http_parse_result result = parse_http_request(client->buffer, client->buffer_len, &client->request, &bytes_consumed);
 
-    if (result == HTTP_INCOMPLETE) {
+    if (result == HTTP_INCOMPLETE){
         return 0;
     }
 
     if (result == HTTP_BAD_REQUEST) {
-        return queue_http_response(epfd, client, 400, "text/plain", 0, 0) == -1 ? -1 : 1;
+        return prepare_http_response(epfd, client, 400, "text/plain", 0, -1, 0) == -1 ? -1 : 1;
     }
 
-    if (bytes_consumed == 0 || bytes_consumed > client->buffer_len) {
+    if (bytes_consumed == 0 || bytes_consumed > client->buffer_len){
         return -1;
-    }
-
-    if (strcmp(client->request.method, "GET") != 0) {
-        return queue_http_response(epfd, client, 405, "text/plain", 0, 0) == -1 ? -1 : 1;
-    }
+    } 
 
     size_t remaining = client->buffer_len - bytes_consumed;
     memmove(client->buffer, client->buffer + bytes_consumed, remaining);
     client->buffer_len = remaining;
 
-    return queue_http_response(epfd, client, 200, "text/plain", 0, client->request.keep_alive) == -1 ? -1 : 1;
+    if (strcmp(client->request.method, "GET") != 0) {
+        return prepare_http_response(epfd, client, 405, "text/plain", 0, -1, 0) == -1 ? -1 : 1;
+    }
+
+    int file_fd = -1;
+    size_t file_size = 0;
+    int status = open_file(client->request.target, &file_fd, &file_size);
+    const char *mime = "text/plain";
+
+    if (status == 200) {
+        char mime_path[HTTP_TARGET_SIZE];
+        size_t path_len = strcspn(client->request.target, "?#");
+
+        if (path_len == 1 || client->request.target[path_len - 1] == '/') {
+            mime = get_mime_type("index.html");
+        } else {
+            memcpy(mime_path, client->request.target, path_len);
+            mime_path[path_len] = '\0';
+            mime = get_mime_type(mime_path);
+        }
+    } else {
+        file_size = 0;
+    }
+
+    int keep_alive = client->request.keep_alive && !client->read_closed;
+
+    return prepare_http_response(epfd, client, status, mime, file_size, file_fd, keep_alive) == -1 ? -1 : 1;
 }
 
 int main(void) {
-    int sd;
-    int nsd;
-    int flags_sd;
-    int flags_nsd;
-    int epfd;
-
+    struct client listener = {0};
     struct epoll_event ev = {0};
     struct epoll_event events[MAX_EVENTS];
-    struct epoll_event client_ev = {0};
+    struct client *client;
 
-    int n_events;
+    int sd, epfd, nsd, flags, n_events;
     ssize_t rv;
 
     sd = server_init();
@@ -141,9 +141,9 @@ int main(void) {
         return 1;
     }
 
-    flags_sd = fcntl(sd, F_GETFL, 0);
+    flags = fcntl(sd, F_GETFL, 0);
 
-    if (flags_sd == -1 || fcntl(sd, F_SETFL, flags_sd | O_NONBLOCK) == -1) {
+    if (flags == -1 || fcntl(sd, F_SETFL, flags | O_NONBLOCK) == -1) {
         perror("fcntl");
         close(sd);
         return 1;
@@ -157,8 +157,11 @@ int main(void) {
         return 1;
     }
 
+    listener.type = LISTENER;
+    listener.fd = sd;
+
     ev.events = EPOLLIN;
-    ev.data.fd = sd;
+    ev.data.ptr = &listener;
 
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, sd, &ev) == -1) {
         perror("epoll_ctl");
@@ -173,179 +176,244 @@ int main(void) {
         n_events = epoll_wait(epfd, events, MAX_EVENTS, -1);
 
         if (n_events == -1) {
-            if (errno == EINTR) {
+            if (errno == EINTR){
                 continue;
-            }
-
+            } 
             perror("epoll_wait");
             break;
         }
 
         for (int i = 0; i < n_events; i++) {
-            int fd = events[i].data.fd;
+            client = events[i].data.ptr;
+            uint32_t event_flags = events[i].events;
 
-            if (fd == sd) {
+            if (client->type == LISTENER) {
                 while (1) {
                     nsd = accept(sd, NULL, NULL);
 
                     if (nsd == -1) {
-                        if (errno == EINTR) {
-                            continue;
-                        }
-
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            break;
-                        }
-
+                        if (errno == EINTR) continue;
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
                         perror("accept");
                         break;
                     }
 
-                    flags_nsd = fcntl(nsd, F_GETFL, 0);
+                    flags = fcntl(nsd, F_GETFL, 0);
 
-                    if (flags_nsd == -1 || fcntl(nsd, F_SETFL, flags_nsd | O_NONBLOCK) == -1) {
+                    if (flags == -1 || fcntl(nsd, F_SETFL, flags | O_NONBLOCK) == -1) {
                         perror("fcntl");
                         close(nsd);
                         continue;
                     }
 
-                    struct client *client = calloc(1, sizeof(struct client));
+                    struct client *new_client = calloc(1, sizeof(struct client));
 
-                    if (client == NULL) {
+                    if (new_client == NULL) {
                         perror("calloc");
                         close(nsd);
                         continue;
                     }
 
-                    client->fd = nsd;
+                    new_client->type = CLIENT;
+                    new_client->fd = nsd;
+                    new_client->file_fd = -1;
 
-                    client_ev.events = EPOLLIN | EPOLLRDHUP;
-                    client_ev.data.fd = nsd;
+                    ev.events = EPOLLIN | EPOLLRDHUP;
+                    ev.data.ptr = new_client;
 
-                    if (epoll_ctl(epfd, EPOLL_CTL_ADD, nsd, &client_ev) == -1) {
+                    if (epoll_ctl(epfd, EPOLL_CTL_ADD, nsd, &ev) == -1) {
                         perror("epoll_ctl");
-                        free(client);
+                        free(new_client);
                         close(nsd);
                         continue;
                     }
 
-                    client->next = clients;
-                    clients = client;
+                    new_client->next = clients;
+                    clients = new_client;
                 }
 
                 continue;
             }
 
-            struct client *client = clients;
-
-            while (client != NULL && client->fd != fd) {
-                client = client->next;
-            }
-
-            if (client == NULL) {
-                continue;
-            }
-
-            uint32_t event_flags = events[i].events;
-
             if (event_flags & EPOLLERR) {
-                close_client(epfd, fd);
+                close_client(epfd, client);
                 continue;
             }
 
             if ((event_flags & EPOLLHUP) && !(event_flags & (EPOLLIN | EPOLLOUT))) {
-                close_client(epfd, fd);
+                close_client(epfd, client);
                 continue;
             }
 
-            if (event_flags & (EPOLLIN | EPOLLRDHUP)) {
+            if (event_flags & EPOLLRDHUP){
+                client->read_closed = 1;
+            } 
+
+            if ((event_flags & (EPOLLIN | EPOLLRDHUP)) && client->response_len == 0) {
                 while (1) {
                     if (client->buffer_len >= SIZEBUF) {
-                        if (queue_http_response(epfd, client, 400, "text/plain", 0, 0) == -1) {
-                            close_client(epfd, fd);
+                        if (prepare_http_response(epfd, client, 400, "text/plain", 0, -1, 0) == -1) {
+                            close_client(epfd, client);
+                            client = NULL;
                         }
                         break;
                     }
 
-                    rv = recv(fd, client->buffer + client->buffer_len, SIZEBUF - client->buffer_len, 0);
+                    rv = recv( client->fd, client->buffer + client->buffer_len, SIZEBUF - client->buffer_len, 0 );
 
                     if (rv > 0) {
                         client->buffer_len += (size_t)rv;
 
-                        int result = process_buffered_request(epfd, client);
+                        int result = process_http_request(epfd, client);
 
                         if (result == -1) {
-                            close_client(epfd, fd);
+                            close_client(epfd, client);
+                            client = NULL;
                             break;
                         }
 
-                        if (result == 1) {
+                        if (result == 1){
                             break;
-                        }
-
+                        } 
                         continue;
                     }
 
                     if (rv == 0) {
                         client->read_closed = 1;
-
-                        if (client->response_len == 0) {
-                            if (client->buffer_len > 0) {
-                                if (queue_http_response(epfd, client, 400, "text/plain", 0, 0) == -1) {
-                                    close_client(epfd, fd);
-                                }
-                            } else {
-                                close_client(epfd, fd);
-                            }
-                        }
-
                         break;
                     }
 
-                    if (errno == EINTR) {
+                    if (errno == EINTR){
                         continue;
-                    }
+                    } 
+                    if (errno == EAGAIN || errno == EWOULDBLOCK){
+                        break;
+                    } 
 
-                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                        perror("recv");
-                        close_client(epfd, fd);
-                    }
-
+                    perror("recv");
+                    close_client(epfd, client);
+                    client = NULL;
                     break;
                 }
 
-                continue;
+                if (client == NULL){
+                     continue;
+                 }
+
+                if (client->read_closed && client->response_len == 0) {
+                    if (client->buffer_len > 0) {
+                        if (prepare_http_response(epfd, client, 400, "text/plain", 0, -1, 0) == -1) {
+                            close_client(epfd, client);
+                            continue;
+                        }
+                    } else {
+                        close_client(epfd, client);
+                        continue;
+                    }
+                }
             }
 
-            if (event_flags & EPOLLOUT) {
-                int result = send_client_response(client);
+            if (client != NULL && (event_flags & EPOLLOUT)) {
+                int failed = 0;
+                int blocked = 0;
 
-                if (result == -1) {
-                    close_client(epfd, fd);
+                while (client->response_sent < client->response_len) {
+                    rv = send(client->fd, client->response + client->response_sent, client->response_len - client->response_sent, MSG_NOSIGNAL);
+
+                    if (rv > 0) {
+                        client->response_sent += (size_t)rv;
+                        continue;
+                    }
+
+                    if (rv == -1 && errno == EINTR){
+                        continue;
+                    }
+
+                    if (rv == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)){
+                        blocked = 1;
+                        break;
+                    } 
+
+                    failed = 1;
+                    break;
+                }
+
+                if (failed) {
+                    close_client(epfd, client);
                     continue;
                 }
 
-                if (result == 0) {
+                if (blocked){
+                    continue;
+                }
+                
+                while (client->file_fd >= 0 && ((size_t)client->file_offset < client->file_size || client->file_buffer_sent < client->file_buffer_len)) {
+                    if (client->file_buffer_sent == client->file_buffer_len) {
+                        client->file_buffer_len = 0;
+                        client->file_buffer_sent = 0;
+
+                        size_t remaining = client->file_size - client->file_offset;
+                        size_t amount = remaining < sizeof(client->file_buffer) ? remaining : sizeof(client->file_buffer);
+
+                        rv = read(client->file_fd, client->file_buffer, amount);
+
+                        if (rv > 0) {
+                            client->file_buffer_len = (size_t)rv;
+                            client->file_offset += (size_t)rv;
+                        } else if (rv == -1 && errno == EINTR) {
+                            continue;
+                        } else {
+                            failed = 1;
+                            break;
+                        }
+                    }
+
+                    rv = send(client->fd, client->file_buffer + client->file_buffer_sent, client->file_buffer_len - client->file_buffer_sent, MSG_NOSIGNAL);
+
+                    if (rv > 0) {
+                        client->file_buffer_sent += (size_t)rv;
+                        continue;
+                    }
+
+                    if (rv == -1 && errno == EINTR) {
+                        continue;
+                    }
+
+                    if (rv == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        blocked = 1;
+                        break;
+                    }
+
+                    failed = 1;
+                    break;
+                }
+
+                if (failed) {
+                    close_client(epfd, client);
                     continue;
                 }
 
-                if (client->close_after_response) {
-                    close_client(epfd, fd);
+                if (blocked) {
+                    continue;
+                }
+
+                if (client->file_fd >= 0) {
+                    close(client->file_fd);
+                    client->file_fd = -1;
+                }
+
+                if (client->close_after_response || client->read_closed) {
+                    close_client(epfd, client);
                     continue;
                 }
 
                 client->response_len = 0;
                 client->response_sent = 0;
 
-                if (client->read_closed && client->buffer_len == 0) {
-                    close_client(epfd, fd);
-                    continue;
-                }
-
-                int pending = process_buffered_request(epfd, client);
+                int pending = process_http_request(epfd, client);
 
                 if (pending == -1) {
-                    close_client(epfd, fd);
+                    close_client(epfd, client);
                     continue;
                 }
 
@@ -353,31 +421,19 @@ int main(void) {
                     continue;
                 }
 
-                if (client->read_closed) {
-                    if (client->buffer_len > 0) {
-                        if (queue_http_response(epfd, client, 400, "text/plain", 0, 0) == -1) {
-                            close_client(epfd, fd);
-                        }
-                    } else {
-                        close_client(epfd, fd);
-                    }
+                ev.events = EPOLLIN | EPOLLRDHUP;
+                ev.data.ptr = client;
 
-                    continue;
-                }
-
-                client_ev.events = EPOLLIN | EPOLLRDHUP;
-                client_ev.data.fd = fd;
-
-                if (epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &client_ev) == -1) {
-                    perror("epoll_ctl EPOLLIN");
-                    close_client(epfd, fd);
+                if (epoll_ctl(epfd, EPOLL_CTL_MOD, client->fd, &ev) == -1) {
+                    perror("epoll_ctl MOD");
+                    close_client(epfd, client);
                 }
             }
         }
     }
 
     while (clients != NULL) {
-        close_client(epfd, clients->fd);
+        close_client(epfd, clients);
     }
 
     close(epfd);
