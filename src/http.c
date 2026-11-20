@@ -173,78 +173,135 @@ static int parse_header_line(const char *line, size_t line_len, int *host_seen){
     return 0;
 }
 
-enum http_parse_result parse_http_request(const char *buffer, size_t buffer_len, struct http_request *request, size_t *bytes_consumed){
 
-    if (buffer == NULL || request == NULL || bytes_consumed == NULL){
+enum http_parse_result parse_http_request(const char *buffer, size_t buffer_len, struct http_request *request, size_t *bytes_consumed){
+    
+    if (buffer == NULL || request == NULL || bytes_consumed == NULL) {
         return HTTP_BAD_REQUEST;
     }
-    
+
     *bytes_consumed = 0;
 
     const char *headers_end = memmem(buffer, buffer_len, "\r\n\r\n", 4);
 
-    if (headers_end == NULL){
-        if(buffer_len > HTTP_MAX_REQUEST_LINE + HTTP_MAX_HEADERS_SIZE + 4){
+    if (headers_end == NULL) {
+
+        const char *request_line_end = memmem(buffer, buffer_len, "\r\n", 2);
+
+        if (request_line_end == NULL) {
+            if (buffer_len > HTTP_MAX_REQUEST_LINE) {
+                return HTTP_BAD_REQUEST;
+            }
+
+            return HTTP_INCOMPLETE;
+        }
+
+        size_t request_line_len = (size_t)(request_line_end - buffer);
+
+        if (request_line_len > HTTP_MAX_REQUEST_LINE) {
             return HTTP_BAD_REQUEST;
         }
+
+        const char *header_start = request_line_end + 2;
+
+        size_t header_bytes = buffer_len - (size_t)(header_start - buffer);
+
+        if (header_bytes > HTTP_MAX_HEADERS_SIZE) {
+            return HTTP_BAD_REQUEST;
+        }
+
+        const char *cursor = header_start;
+        const char *buffer_end = buffer + buffer_len;
+
+        int host_seen = 0;
+
+        while (cursor < buffer_end) {
+
+            const char *line_end =
+                memmem(cursor, (size_t)(buffer_end - cursor), "\r\n", 2);
+
+            if (line_end == NULL) {
+
+                size_t partial_line_len = (size_t)(buffer_end - cursor);
+
+                if (partial_line_len > HTTP_MAX_HEADER_LINE) {
+                    return HTTP_BAD_REQUEST;
+                }
+
+                break;
+            }
+
+            size_t line_len = (size_t)(line_end - cursor);
+
+            if (line_len > HTTP_MAX_HEADER_LINE) {
+                return HTTP_BAD_REQUEST;
+            }
+
+            if (line_len > 0 && parse_header_line(cursor, line_len, &host_seen) != 0) {
+                return HTTP_BAD_REQUEST;
+            }
+
+            cursor = line_end + 2;
+        }
+
         return HTTP_INCOMPLETE;
     }
 
     const char *request_line_end = memmem(buffer, buffer_len, "\r\n", 2);
 
-    if (request_line_end == NULL || request_line_end >= headers_end){
+    if (request_line_end == NULL || request_line_end >= headers_end) {
         return HTTP_BAD_REQUEST;
     }
 
     size_t request_line_len = (size_t)(request_line_end - buffer);
 
-    if (request_line_len > HTTP_MAX_REQUEST_LINE){
+    if (request_line_len > HTTP_MAX_REQUEST_LINE) {
         return HTTP_BAD_REQUEST;
     }
 
-    if (extract_request_line(buffer, request_line_len, request) != 0){
+    if (extract_request_line(buffer, request_line_len, request) != 0) {
         return HTTP_BAD_REQUEST;
     }
 
     const char *header_start = request_line_end + 2;
 
-    size_t header_len = (size_t)(headers_end - header_start);
+    size_t header_bytes = (size_t)((headers_end + 2) - header_start);
 
-    if(header_len > HTTP_MAX_HEADERS_SIZE){
+    if (header_bytes > HTTP_MAX_HEADERS_SIZE) {
         return HTTP_BAD_REQUEST;
     }
 
     const char *cursor = header_start;
+    const char *headers_limit = headers_end + 2;
 
     int host_seen = 0;
 
-    while (cursor < headers_end){
-        const char *line_end = memchr(cursor, '\r', (size_t)(headers_end - cursor));
+    while (cursor < headers_limit) {
 
-        if(line_end == NULL || line_end + 1 >= headers_end + 2 || line_end[1] != '\n'){
+        const char *line_end = memchr(cursor, '\r', (size_t)(headers_limit - cursor));
+
+        if (line_end == NULL || line_end + 1 >= headers_limit || line_end[1] != '\n') {
             return HTTP_BAD_REQUEST;
         }
 
         size_t line_len = (size_t)(line_end - cursor);
 
-        if (line_len > HTTP_MAX_HEADER_LINE){
+        if (line_len > HTTP_MAX_HEADER_LINE) {
             return HTTP_BAD_REQUEST;
         }
 
-        if (parse_header_line(cursor, line_len, &host_seen) != 0){
+        if (parse_header_line(cursor, line_len, &host_seen) != 0) {
             return HTTP_BAD_REQUEST;
         }
-        
+
         cursor = line_end + 2;
     }
 
-    if (!host_seen){
+    if (!host_seen) {
         return HTTP_BAD_REQUEST;
     }
 
-    *bytes_consumed = (size_t)(headers_end - buffer) + 4;
+    *bytes_consumed = (size_t)((headers_end + 4) - buffer);
 
-    
     return HTTP_COMPLETE;
-
 }
