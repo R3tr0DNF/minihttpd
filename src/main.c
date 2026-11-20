@@ -197,12 +197,7 @@ int main() {
                     continue;
                 }
 
-                rv = recv(
-                    client->fd,
-                    client->buffer + client->buffer_len,
-                    SIZEBUF - client->buffer_len,
-                    0
-                );
+                rv = recv(client->fd, client->buffer + client->buffer_len, SIZEBUF - client->buffer_len, 0);
 
                 if (rv > 0) {
                     client->buffer_len += (size_t)rv;

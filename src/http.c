@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 
 #include "http.h"
+#include <stdio.h>
 #include <strings.h>
 #include <string.h>
 
@@ -304,4 +305,68 @@ enum http_parse_result parse_http_request(const char *buffer, size_t buffer_len,
     *bytes_consumed = (size_t)((headers_end + 4) - buffer);
 
     return HTTP_COMPLETE;
+}
+
+static const char *get_status_message(int status_code){
+    switch (status_code){
+    case 200:
+        return "OK";
+    
+    case 400:
+        return "Bad Request";
+    
+    case 403:
+        return "Forbidden";
+
+    case 404:
+        return "Not Found";
+    
+    case 405:
+        return "Method Not Allowed";
+    
+    case 500:
+        return "Internal Server Error";
+    
+    default:
+        return NULL;
+    }
+
+}
+
+int build_http_response(int status_code, const char *content_type, size_t content_length, int keep_alive, char *buffer, size_t buffer_size){
+    if (buffer == NULL || content_type == NULL || buffer_size == 0){
+        return -1;
+    }
+    
+    const char *status_message = get_status_message(status_code);
+
+    if (status_message == NULL){
+        return -1;
+    }
+
+    if (strchr(content_type,'\r')!= NULL || strchr(content_type,'\n')!= NULL){
+        return -1;
+    }
+
+    int written = snprintf(
+        buffer,
+        buffer_size,
+        "HTTP/1.1 %d %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: %s\r\n"
+        "\r\n",
+        status_code,
+        status_message,
+        content_type,
+        content_length,
+        keep_alive ? "keep-alive" : "close"
+    );
+
+    if (written < 0 || (size_t)written >= buffer_size){
+        return -1;
+    }
+
+    return written;
+
 }

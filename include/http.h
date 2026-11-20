@@ -30,4 +30,12 @@ enum http_parse_result parse_http_request(
     size_t *bytes_consumed
 );
 
+int build_http_response(
+    int status_code, 
+    const char *content_type, 
+    size_t content_length, 
+    int keep_alive, 
+    char *buffer, 
+    size_t buffer_size);
+
 #endif
