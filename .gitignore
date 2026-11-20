@@ -49,3 +49,7 @@ logs/
 *.gcno
 *.gcov
 coverage/
+
+# Development tests
+tests/
+test_*
