@@ -33,7 +33,6 @@ MiniHTTPd/
 │   ├── main.c
 │   ├── mime.c
 │   └── server.c
-├── tests/
 ├── www/
 │   ├── index.html
 │   ├── style.css
