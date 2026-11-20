@@ -15,20 +15,7 @@
 
 #define MAX_EVENTS 64
 
-struct client *clients = NULL;
-
 static void close_client(int epfd, struct client *client) {
-    struct client **current = &clients;
-
-    while (*current != NULL && *current != client){
-        current = &(*current)->next;
-    } 
-
-    if (*current == NULL){
-        return;
-    }
-
-    *current = client->next;
     epoll_ctl(epfd, EPOLL_CTL_DEL, client->fd, NULL);
     close(client->fd);
 
@@ -38,7 +25,7 @@ static void close_client(int epfd, struct client *client) {
     free(client);
 }
 
-static int prepare_http_response(int epfd, struct client *client, int status, const char *mime, size_t file_size, int file_fd, int keep_alive) {
+static int http_response(int epfd, struct client *client, int status, const char *mime, size_t file_size, int file_fd, int keep_alive) {
     
     int header_length = build_http_response(status, mime, file_size, keep_alive, client->response, sizeof(client->response));
 
@@ -59,7 +46,7 @@ static int prepare_http_response(int epfd, struct client *client, int status, co
     client->close_after_response = !keep_alive;
 
     struct epoll_event ev = {0};
-    ev.events = EPOLLOUT | EPOLLRDHUP;
+    ev.events = EPOLLOUT;
     ev.data.ptr = client;
 
     if (epoll_ctl(epfd, EPOLL_CTL_MOD, client->fd, &ev) == -1) {
@@ -84,7 +71,7 @@ static int process_http_request(int epfd, struct client *client) {
     }
 
     if (result == HTTP_BAD_REQUEST) {
-        return prepare_http_response(epfd, client, HTTP_STATUS_BAD_REQUEST, "text/plain", 0, -1, 0) == -1 ? -1 : 1;
+        return http_response(epfd, client, HTTP_STATUS_BAD_REQUEST, "text/plain", 0, -1, 0) == -1 ? -1 : 1;
     }
 
     if (bytes_consumed == 0 || bytes_consumed > client->buffer_len){
@@ -96,7 +83,7 @@ static int process_http_request(int epfd, struct client *client) {
     client->buffer_len = remaining;
 
     if (strcmp(client->request.method, "GET") != 0) {
-        return prepare_http_response(epfd, client, HTTP_STATUS_METHOD_NOT_ALLOWED, "text/plain", 0, -1, 0) == -1 ? -1 : 1;
+        return http_response(epfd, client, HTTP_STATUS_METHOD_NOT_ALLOWED, "text/plain", 0, -1, 0) == -1 ? -1 : 1;
     }
 
     int file_fd = -1;
@@ -121,7 +108,7 @@ static int process_http_request(int epfd, struct client *client) {
 
     int keep_alive = client->request.keep_alive && !client->read_closed;
 
-    return prepare_http_response(epfd, client, status, mime, file_size, file_fd, keep_alive) == -1 ? -1 : 1;
+    return http_response(epfd, client, status, mime, file_size, file_fd, keep_alive) == -1 ? -1 : 1;
 }
 
 int main(void) {
@@ -191,8 +178,15 @@ int main(void) {
                     nsd = accept(sd, NULL, NULL);
 
                     if (nsd == -1) {
-                        if (errno == EINTR) continue;
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+
+                        if (errno == EINTR){
+                            continue;
+                        }
+
+                        if (errno == EAGAIN || errno == EWOULDBLOCK){
+                            break;
+                        } 
+
                         perror("accept");
                         break;
                     }
@@ -217,7 +211,7 @@ int main(void) {
                     new_client->fd = nsd;
                     new_client->file_fd = -1;
 
-                    ev.events = EPOLLIN | EPOLLRDHUP;
+                    ev.events = EPOLLIN;
                     ev.data.ptr = new_client;
 
                     if (epoll_ctl(epfd, EPOLL_CTL_ADD, nsd, &ev) == -1) {
@@ -227,8 +221,6 @@ int main(void) {
                         continue;
                     }
 
-                    new_client->next = clients;
-                    clients = new_client;
                 }
 
                 continue;
@@ -244,23 +236,21 @@ int main(void) {
                 continue;
             }
 
-            if (event_flags & EPOLLRDHUP){
-                client->read_closed = 1;
-            } 
-
             if ((event_flags & (EPOLLIN | EPOLLRDHUP)) && client->response_len == 0) {
                 while (1) {
                     if (client->buffer_len >= SIZEBUF) {
-                        if (prepare_http_response(epfd, client, HTTP_BAD_REQUEST, "text/plain", 0, -1, 0) == -1) {
+                        if (http_response(epfd, client, HTTP_BAD_REQUEST, "text/plain", 0, -1, 0) == -1) {
                             close_client(epfd, client);
                             client = NULL;
                         }
+
                         break;
                     }
 
                     rv = recv( client->fd, client->buffer + client->buffer_len, SIZEBUF - client->buffer_len, 0 );
 
                     if (rv > 0) {
+                        
                         client->buffer_len += (size_t)rv;
 
                         int result = process_http_request(epfd, client);
@@ -301,7 +291,7 @@ int main(void) {
 
                 if (client->read_closed && client->response_len == 0) {
                     if (client->buffer_len > 0) {
-                        if (prepare_http_response(epfd, client, HTTP_BAD_REQUEST, "text/plain", 0, -1, 0) == -1) {
+                        if (http_response(epfd, client, HTTP_BAD_REQUEST, "text/plain", 0, -1, 0) == -1) {
                             close_client(epfd, client);
                             continue;
                         }
@@ -317,6 +307,7 @@ int main(void) {
                 int blocked = 0;
 
                 while (client->response_sent < client->response_len) {
+                    
                     rv = send(client->fd, client->response + client->response_sent, client->response_len - client->response_sent, MSG_NOSIGNAL);
 
                     if (rv > 0) {
@@ -420,7 +411,7 @@ int main(void) {
                     continue;
                 }
 
-                ev.events = EPOLLIN | EPOLLRDHUP;
+                ev.events = EPOLLIN;
                 ev.data.ptr = client;
 
                 if (epoll_ctl(epfd, EPOLL_CTL_MOD, client->fd, &ev) == -1) {
@@ -429,10 +420,6 @@ int main(void) {
                 }
             }
         }
-    }
-
-    while (clients != NULL) {
-        close_client(epfd, clients);
     }
 
     close(epfd);

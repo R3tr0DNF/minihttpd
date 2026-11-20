@@ -30,7 +30,6 @@ struct client {
     size_t file_buffer_sent;
     int close_after_response;
     int read_closed;
-    struct client *next;
 };
 
 
