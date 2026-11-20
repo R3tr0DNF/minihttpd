@@ -211,29 +211,45 @@ int main() {
                     fwrite(client->buffer, 1, client->buffer_len, stdout);
                     printf("\n");
 
-                    size_t bytes_consumed = 0;
+                    while (client -> buffer_len > 0){
 
-                    enum http_parse_result result = parse_http_request(
-                        client->buffer,
-                        client->buffer_len,
-                        &client->request,
-                        &bytes_consumed
-                    );
+                        size_t bytes_consumed = 0;
 
-                    if (result == HTTP_INCOMPLETE) {
-                        printf("Incomplete HTTP request from fd %d\n", client->fd);
-                    }
+                        enum http_parse_result result = parse_http_request(
+                            client->buffer,
+                            client->buffer_len,
+                            &client->request,
+                            &bytes_consumed
+                        );
 
-                    else if (result == HTTP_COMPLETE) {
+                        if (result == HTTP_INCOMPLETE) {
+                            printf("Incomplete HTTP request from fd %d\n", client->fd);
+                            break;
+                        }
+
+                        if (result == HTTP_BAD_REQUEST){
+                            printf("Bad HTTP request from fd %d\n", client ->fd);
+                            break;
+                        }
+
+                        if (bytes_consumed == 0 || bytes_consumed > client ->buffer_len){
+                            fprintf(stderr, "Invalid bytes_consumed from fd %d\n", client->fd);
+                            break;
+                        }
+
                         printf("Complete HTTP request from fd %d\n", client->fd);
                         printf("Method: %s\n", client->request.method);
                         printf("Target: %s\n", client->request.target);
                         printf("Version: %s\n", client->request.version);
-                    }
 
-                    else if (result == HTTP_BAD_REQUEST) {
-                        printf("Bad HTTP request from fd %d\n", client->fd);
+                        size_t remaining = client ->buffer_len - bytes_consumed;
+
+                        memmove(client->buffer, client->buffer + bytes_consumed, remaining);
+                        
+                        client ->buffer_len = remaining;
+
                     }
+                   
                 }
 
                 if (rv == 0) {
