@@ -2,7 +2,6 @@
 #include <stdio.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <netinet/in.h>
 #include "server.h"
 #include <sys/epoll.h>
 #include <fcntl.h>
@@ -17,9 +16,18 @@
 
 struct client {
     int fd;
+
     char buffer[SIZEBUF];
     size_t buffer_len;
+
     struct http_request request;
+
+    char response[SIZEBUF];
+    size_t response_len;
+    size_t response_sent;
+
+    int close_after_response;
+
     struct client *next;
 };
 
@@ -40,13 +48,98 @@ void close_client(int epfd, int fd) {
 
     *current = client->next;
 
-
     if (epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL) == -1) {
         perror("epoll_ctl DEL");
     }
 
     close(fd);
     free(client);
+}
+
+static int queue_http_response(int epfd, struct client *client, int status_code, const char *content_type, size_t content_length, int keep_alive) {
+    int response_size = build_http_response(status_code, content_type, content_length, keep_alive, client->response, sizeof(client->response));
+
+    if (response_size == -1) {
+        return -1;
+    }
+
+    client->response_len = (size_t)response_size;
+    client->response_sent = 0;
+    client->close_after_response = !keep_alive;
+
+    struct epoll_event client_ev;
+
+    client_ev.events = EPOLLOUT;
+    client_ev.data.fd = client->fd;
+
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, client->fd, &client_ev) == -1) {
+        perror("epoll_ctl EPOLLOUT");
+        return -1;
+    }
+
+    return 0;
+}
+
+static int send_client_response(struct client *client) {
+    while (client->response_sent < client->response_len) {
+        ssize_t sent = send(client->fd, client->response + client->response_sent, client->response_len - client->response_sent, MSG_NOSIGNAL);
+
+        if (sent > 0) {
+            client->response_sent += (size_t)sent;
+            continue;
+        }
+
+        if (sent == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return 0;
+            }
+        }
+
+        return -1;
+    }
+
+    return 1;
+}
+
+static int process_buffered_request(int epfd, struct client *client) {
+    size_t bytes_consumed = 0;
+
+    if (client->buffer_len == 0) {
+        return 0;
+    }
+
+    enum http_parse_result result = parse_http_request(client->buffer, client->buffer_len, &client->request, &bytes_consumed);
+
+    if (result == HTTP_INCOMPLETE) {
+        return 0;
+    }
+
+    if (result == HTTP_BAD_REQUEST) {
+        return queue_http_response(epfd, client, 400, "text/plain", 0, 0) == -1 ? -1 : 1;
+    }
+
+    if (bytes_consumed == 0 || bytes_consumed > client->buffer_len) {
+        return -1;
+    }
+
+    if (strcmp(client->request.method, "GET") != 0) {
+        return queue_http_response(epfd, client, 405, "text/plain", 0, 0) == -1 ? -1 : 1;
+    }
+
+    size_t remaining = client->buffer_len - bytes_consumed;
+
+    memmove(client->buffer, client->buffer + bytes_consumed, remaining);
+    client->buffer_len = remaining;
+
+    if (queue_http_response(epfd, client, 200, "text/plain", 0, 1) == -1) {
+        return -1;
+    }
+
+    return 1;
 }
 
 int main() {
@@ -61,7 +154,6 @@ int main() {
     struct epoll_event client_ev;
 
     int n_events;
-    char buffer[SIZEBUF];
     ssize_t rv;
 
     sd = server_init();
@@ -173,8 +265,6 @@ int main() {
 
                     client->next = clients;
                     clients = client;
-
-                    printf("New client connected, fd: %d\n", nsd);
                 }
 
             } else {
@@ -190,6 +280,51 @@ int main() {
                     continue;
                 }
 
+                if (events[i].events & EPOLLOUT) {
+                    int result = send_client_response(client);
+
+                    if (result == -1) {
+                        fprintf(stderr, "Error sending response to fd %d\n", fd);
+                        close_client(epfd, fd);
+                        continue;
+                    }
+
+                    if (result == 0) {
+                        continue;
+                    }
+
+                    if (client->close_after_response) {
+                        close_client(epfd, fd);
+                        continue;
+                    }
+
+                    client->response_len = 0;
+                    client->response_sent = 0;
+
+                    int pending = process_buffered_request(epfd, client);
+
+                    if (pending == -1) {
+                        fprintf(stderr, "Error processing buffered request from fd %d\n", fd);
+                        close_client(epfd, fd);
+                        continue;
+                    }
+
+                    if (pending == 1) {
+                        continue;
+                    }
+
+                    client_ev.events = EPOLLIN;
+                    client_ev.data.fd = fd;
+
+                    if (epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &client_ev) == -1) {
+                        perror("epoll_ctl EPOLLIN");
+                        close_client(epfd, fd);
+                        continue;
+                    }
+
+                    continue;
+                }
+
                 if (client->buffer_len >= SIZEBUF) {
                     fprintf(stderr, "Request buffer is full for fd %d\n", client->fd);
 
@@ -202,54 +337,16 @@ int main() {
                 if (rv > 0) {
                     client->buffer_len += (size_t)rv;
 
-                    printf("Received data from fd %d:\n", fd);
-                    fwrite(client->buffer, 1, client->buffer_len, stdout);
-                    printf("\n");
+                    int result = process_buffered_request(epfd, client);
 
-                    while (client -> buffer_len > 0){
-
-                        size_t bytes_consumed = 0;
-
-                        enum http_parse_result result = parse_http_request(
-                            client->buffer,
-                            client->buffer_len,
-                            &client->request,
-                            &bytes_consumed
-                        );
-
-                        if (result == HTTP_INCOMPLETE) {
-                            printf("Incomplete HTTP request from fd %d\n", client->fd);
-                            break;
-                        }
-
-                        if (result == HTTP_BAD_REQUEST){
-                            printf("Bad HTTP request from fd %d\n", client ->fd);
-                            break;
-                        }
-
-                        if (bytes_consumed == 0 || bytes_consumed > client ->buffer_len){
-                            fprintf(stderr, "Invalid bytes_consumed from fd %d\n", client->fd);
-                            break;
-                        }
-
-                        printf("Complete HTTP request from fd %d\n", client->fd);
-                        printf("Method: %s\n", client->request.method);
-                        printf("Target: %s\n", client->request.target);
-                        printf("Version: %s\n", client->request.version);
-
-                        size_t remaining = client ->buffer_len - bytes_consumed;
-
-                        memmove(client->buffer, client->buffer + bytes_consumed, remaining);
-                        
-                        client ->buffer_len = remaining;
-
+                    if (result == -1) {
+                        fprintf(stderr, "Error processing request from fd %d\n", fd);
+                        close_client(epfd, fd);
+                        continue;
                     }
-                   
                 }
 
                 if (rv == 0) {
-                    printf("Client disconnected, fd: %d\n", fd);
-
                     close_client(epfd, fd);
                     continue;
                 }
@@ -260,7 +357,6 @@ int main() {
                     }
 
                     if (errno == EINTR) {
-                        printf("Call interrupted...\n");
                         continue;
                     }
 

@@ -115,7 +115,7 @@ static int is_valid_header_name_char(unsigned char character){
     return strchr(valid_special_chars, character) != NULL;
 }
 
-static int parse_header_line(const char *line, size_t line_len, int *host_seen){
+static int parse_header_line(const char *line, size_t line_len, int *host_seen, int *keep_alive, int *connection_seen){
     if (line == NULL || line_len == 0 || line_len > HTTP_MAX_HEADER_LINE){
         return -1;
     }
@@ -171,6 +171,35 @@ static int parse_header_line(const char *line, size_t line_len, int *host_seen){
 
     }
 
+    if (name_len == 10 && strncasecmp(line, "Connection", 10) == 0) {
+        if (*connection_seen) {
+            return -1;
+        }
+
+        while (value_len > 0 && (*value_start == ' ' || *value_start == '\t')) {
+            value_start++;
+            value_len--;
+        }
+
+        while (value_len > 0 && (value_start[value_len - 1] == ' ' || value_start[value_len - 1] == '\t')) {
+            value_len--;
+        }
+
+        if (value_len == 0) {
+            return -1;
+        }
+
+        if (value_len == 5 && strncasecmp(value_start, "close", 5) == 0) {
+            *keep_alive = 0;
+        } else if (value_len == 10 && strncasecmp(value_start, "keep-alive", 10) == 0) {
+            *keep_alive = 1;
+        } else {
+            return -1;
+        }
+
+        *connection_seen = 1;
+    }
+
     return 0;
 }
 
@@ -215,6 +244,8 @@ enum http_parse_result parse_http_request(const char *buffer, size_t buffer_len,
         const char *buffer_end = buffer + buffer_len;
 
         int host_seen = 0;
+        int connection_seen = 0;
+        int keep_alive = 1;
 
         while (cursor < buffer_end) {
 
@@ -238,7 +269,7 @@ enum http_parse_result parse_http_request(const char *buffer, size_t buffer_len,
                 return HTTP_BAD_REQUEST;
             }
 
-            if (line_len > 0 && parse_header_line(cursor, line_len, &host_seen) != 0) {
+            if (line_len > 0 && parse_header_line(cursor, line_len, &host_seen, &keep_alive, &connection_seen) != 0) {
                 return HTTP_BAD_REQUEST;
             }
 
@@ -276,6 +307,8 @@ enum http_parse_result parse_http_request(const char *buffer, size_t buffer_len,
     const char *headers_limit = headers_end + 2;
 
     int host_seen = 0;
+    int connection_seen = 0;
+    int keep_alive = 1;
 
     while (cursor < headers_limit) {
 
@@ -291,7 +324,7 @@ enum http_parse_result parse_http_request(const char *buffer, size_t buffer_len,
             return HTTP_BAD_REQUEST;
         }
 
-        if (parse_header_line(cursor, line_len, &host_seen) != 0) {
+        if (parse_header_line(cursor, line_len, &host_seen, &keep_alive, &connection_seen) != 0) {
             return HTTP_BAD_REQUEST;
         }
 
@@ -301,6 +334,8 @@ enum http_parse_result parse_http_request(const char *buffer, size_t buffer_len,
     if (!host_seen) {
         return HTTP_BAD_REQUEST;
     }
+
+    request->keep_alive = keep_alive;
 
     *bytes_consumed = (size_t)((headers_end + 4) - buffer);
 
@@ -348,19 +383,13 @@ int build_http_response(int status_code, const char *content_type, size_t conten
         return -1;
     }
 
-    int written = snprintf(
-        buffer,
-        buffer_size,
+    int written = snprintf(buffer,buffer_size,
         "HTTP/1.1 %d %s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
         "Connection: %s\r\n"
         "\r\n",
-        status_code,
-        status_message,
-        content_type,
-        content_length,
-        keep_alive ? "keep-alive" : "close"
+        status_code, status_message, content_type, content_length, keep_alive ? "keep-alive" : "close"
     );
 
     if (written < 0 || (size_t)written >= buffer_size){

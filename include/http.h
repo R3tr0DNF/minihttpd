@@ -21,6 +21,8 @@ struct http_request {
     char method[HTTP_METHOD_SIZE];
     char target[HTTP_TARGET_SIZE];
     char version[HTTP_VERSION_SIZE];
+
+    int keep_alive;
 };
 
 enum http_parse_result parse_http_request(
