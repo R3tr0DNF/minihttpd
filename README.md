@@ -43,9 +43,9 @@ MiniHTTPd/
 └── README.md
 ```
 
-### Descripción de los módulos
+### Archivos
 
-| Módulo | Responsabilidad |
+| Archivo | ¿Qué hace? |
 |---|---|
 | `main.c` | Coordina epoll, recibe las solicitudes, respuesta y envio de datos. |
 | `server.c` | Creación y configuración del socket del servidor. |
