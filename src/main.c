@@ -6,28 +6,23 @@
 #include <sys/epoll.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include "http.h"
 
-#define SIZEBUF 4096
+#define SIZEBUF (HTTP_MAX_REQUEST_LINE + HTTP_MAX_HEADERS_SIZE + 4)
 #define MAX_EVENTS 64
 
 struct client {
     int fd;
-
     char buffer[SIZEBUF];
     size_t buffer_len;
-
     struct http_request request;
-
-    char response[SIZEBUF];
+    char response[4096];
     size_t response_len;
     size_t response_sent;
-
     int close_after_response;
-
+    int read_closed;
     struct client *next;
 };
 
@@ -45,13 +40,9 @@ void close_client(int epfd, int fd) {
     }
 
     struct client *client = *current;
-
     *current = client->next;
 
-    if (epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL) == -1) {
-        perror("epoll_ctl DEL");
-    }
-
+    epoll_ctl(epfd, EPOLL_CTL_DEL, fd, NULL);
     close(fd);
     free(client);
 }
@@ -67,17 +58,11 @@ static int queue_http_response(int epfd, struct client *client, int status_code,
     client->response_sent = 0;
     client->close_after_response = !keep_alive;
 
-    struct epoll_event client_ev;
-
-    client_ev.events = EPOLLOUT;
+    struct epoll_event client_ev = {0};
+    client_ev.events = EPOLLOUT | EPOLLRDHUP;
     client_ev.data.fd = client->fd;
 
-    if (epoll_ctl(epfd, EPOLL_CTL_MOD, client->fd, &client_ev) == -1) {
-        perror("epoll_ctl EPOLLOUT");
-        return -1;
-    }
-
-    return 0;
+    return epoll_ctl(epfd, EPOLL_CTL_MOD, client->fd, &client_ev);
 }
 
 static int send_client_response(struct client *client) {
@@ -89,14 +74,12 @@ static int send_client_response(struct client *client) {
             continue;
         }
 
-        if (sent == -1) {
-            if (errno == EINTR) {
-                continue;
-            }
+        if (sent == -1 && errno == EINTR) {
+            continue;
+        }
 
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                return 0;
-            }
+        if (sent == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            return 0;
         }
 
         return -1;
@@ -131,27 +114,22 @@ static int process_buffered_request(int epfd, struct client *client) {
     }
 
     size_t remaining = client->buffer_len - bytes_consumed;
-
     memmove(client->buffer, client->buffer + bytes_consumed, remaining);
     client->buffer_len = remaining;
 
-    if (queue_http_response(epfd, client, 200, "text/plain", 0, 1) == -1) {
-        return -1;
-    }
-
-    return 1;
+    return queue_http_response(epfd, client, 200, "text/plain", 0, client->request.keep_alive) == -1 ? -1 : 1;
 }
 
-int main() {
+int main(void) {
     int sd;
     int nsd;
     int flags_sd;
     int flags_nsd;
     int epfd;
 
-    struct epoll_event ev;
+    struct epoll_event ev = {0};
     struct epoll_event events[MAX_EVENTS];
-    struct epoll_event client_ev;
+    struct epoll_event client_ev = {0};
 
     int n_events;
     ssize_t rv;
@@ -165,14 +143,8 @@ int main() {
 
     flags_sd = fcntl(sd, F_GETFL, 0);
 
-    if (flags_sd == -1) {
-        perror("fcntl F_GETFL");
-        close(sd);
-        return 1;
-    }
-
-    if (fcntl(sd, F_SETFL, flags_sd | O_NONBLOCK) == -1) {
-        perror("fcntl F_SETFL");
+    if (flags_sd == -1 || fcntl(sd, F_SETFL, flags_sd | O_NONBLOCK) == -1) {
+        perror("fcntl");
         close(sd);
         return 1;
     }
@@ -217,12 +189,12 @@ int main() {
                     nsd = accept(sd, NULL, NULL);
 
                     if (nsd == -1) {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            break;
-                        }
-
                         if (errno == EINTR) {
                             continue;
+                        }
+
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            break;
                         }
 
                         perror("accept");
@@ -231,14 +203,8 @@ int main() {
 
                     flags_nsd = fcntl(nsd, F_GETFL, 0);
 
-                    if (flags_nsd == -1) {
-                        perror("fcntl F_GETFL");
-                        close(nsd);
-                        continue;
-                    }
-
-                    if (fcntl(nsd, F_SETFL, flags_nsd | O_NONBLOCK) == -1) {
-                        perror("fcntl F_SETFL");
+                    if (flags_nsd == -1 || fcntl(nsd, F_SETFL, flags_nsd | O_NONBLOCK) == -1) {
+                        perror("fcntl");
                         close(nsd);
                         continue;
                     }
@@ -253,7 +219,7 @@ int main() {
 
                     client->fd = nsd;
 
-                    client_ev.events = EPOLLIN;
+                    client_ev.events = EPOLLIN | EPOLLRDHUP;
                     client_ev.data.fd = nsd;
 
                     if (epoll_ctl(epfd, EPOLL_CTL_ADD, nsd, &client_ev) == -1) {
@@ -267,105 +233,151 @@ int main() {
                     clients = client;
                 }
 
-            } else {
+                continue;
+            }
 
-                struct client *client = clients;
+            struct client *client = clients;
 
-                while (client != NULL && client->fd != fd) {
-                    client = client->next;
-                }
+            while (client != NULL && client->fd != fd) {
+                client = client->next;
+            }
 
-                if (client == NULL) {
-                    fprintf(stderr, "Client not found: fd %d\n", fd);
-                    continue;
-                }
+            if (client == NULL) {
+                continue;
+            }
 
-                if (events[i].events & EPOLLOUT) {
-                    int result = send_client_response(client);
+            uint32_t event_flags = events[i].events;
 
-                    if (result == -1) {
-                        fprintf(stderr, "Error sending response to fd %d\n", fd);
-                        close_client(epfd, fd);
+            if (event_flags & EPOLLERR) {
+                close_client(epfd, fd);
+                continue;
+            }
+
+            if ((event_flags & EPOLLHUP) && !(event_flags & (EPOLLIN | EPOLLOUT))) {
+                close_client(epfd, fd);
+                continue;
+            }
+
+            if (event_flags & (EPOLLIN | EPOLLRDHUP)) {
+                while (1) {
+                    if (client->buffer_len >= SIZEBUF) {
+                        if (queue_http_response(epfd, client, 400, "text/plain", 0, 0) == -1) {
+                            close_client(epfd, fd);
+                        }
+                        break;
+                    }
+
+                    rv = recv(fd, client->buffer + client->buffer_len, SIZEBUF - client->buffer_len, 0);
+
+                    if (rv > 0) {
+                        client->buffer_len += (size_t)rv;
+
+                        int result = process_buffered_request(epfd, client);
+
+                        if (result == -1) {
+                            close_client(epfd, fd);
+                            break;
+                        }
+
+                        if (result == 1) {
+                            break;
+                        }
+
                         continue;
                     }
 
-                    if (result == 0) {
-                        continue;
-                    }
+                    if (rv == 0) {
+                        client->read_closed = 1;
 
-                    if (client->close_after_response) {
-                        close_client(epfd, fd);
-                        continue;
-                    }
+                        if (client->response_len == 0) {
+                            if (client->buffer_len > 0) {
+                                if (queue_http_response(epfd, client, 400, "text/plain", 0, 0) == -1) {
+                                    close_client(epfd, fd);
+                                }
+                            } else {
+                                close_client(epfd, fd);
+                            }
+                        }
 
-                    client->response_len = 0;
-                    client->response_sent = 0;
-
-                    int pending = process_buffered_request(epfd, client);
-
-                    if (pending == -1) {
-                        fprintf(stderr, "Error processing buffered request from fd %d\n", fd);
-                        close_client(epfd, fd);
-                        continue;
-                    }
-
-                    if (pending == 1) {
-                        continue;
-                    }
-
-                    client_ev.events = EPOLLIN;
-                    client_ev.data.fd = fd;
-
-                    if (epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &client_ev) == -1) {
-                        perror("epoll_ctl EPOLLIN");
-                        close_client(epfd, fd);
-                        continue;
-                    }
-
-                    continue;
-                }
-
-                if (client->buffer_len >= SIZEBUF) {
-                    fprintf(stderr, "Request buffer is full for fd %d\n", client->fd);
-
-                    close_client(epfd, fd);
-                    continue;
-                }
-
-                rv = recv(client->fd, client->buffer + client->buffer_len, SIZEBUF - client->buffer_len, 0);
-
-                if (rv > 0) {
-                    client->buffer_len += (size_t)rv;
-
-                    int result = process_buffered_request(epfd, client);
-
-                    if (result == -1) {
-                        fprintf(stderr, "Error processing request from fd %d\n", fd);
-                        close_client(epfd, fd);
-                        continue;
-                    }
-                }
-
-                if (rv == 0) {
-                    close_client(epfd, fd);
-                    continue;
-                }
-
-                if (rv == -1) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        continue;
+                        break;
                     }
 
                     if (errno == EINTR) {
                         continue;
                     }
 
-                    perror("recv");
+                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                        perror("recv");
+                        close_client(epfd, fd);
+                    }
+
+                    break;
+                }
+
+                continue;
+            }
+
+            if (event_flags & EPOLLOUT) {
+                int result = send_client_response(client);
+
+                if (result == -1) {
                     close_client(epfd, fd);
                     continue;
                 }
+
+                if (result == 0) {
+                    continue;
+                }
+
+                if (client->close_after_response) {
+                    close_client(epfd, fd);
+                    continue;
+                }
+
+                client->response_len = 0;
+                client->response_sent = 0;
+
+                if (client->read_closed && client->buffer_len == 0) {
+                    close_client(epfd, fd);
+                    continue;
+                }
+
+                int pending = process_buffered_request(epfd, client);
+
+                if (pending == -1) {
+                    close_client(epfd, fd);
+                    continue;
+                }
+
+                if (pending == 1) {
+                    continue;
+                }
+
+                if (client->read_closed) {
+                    if (client->buffer_len > 0) {
+                        if (queue_http_response(epfd, client, 400, "text/plain", 0, 0) == -1) {
+                            close_client(epfd, fd);
+                        }
+                    } else {
+                        close_client(epfd, fd);
+                    }
+
+                    continue;
+                }
+
+                client_ev.events = EPOLLIN | EPOLLRDHUP;
+                client_ev.data.fd = fd;
+
+                if (epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &client_ev) == -1) {
+                    perror("epoll_ctl EPOLLIN");
+                    close_client(epfd, fd);
+                }
             }
         }
+    }
+
+    while (clients != NULL) {
+        close_client(epfd, clients->fd);
     }
 
     close(epfd);
